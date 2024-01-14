@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     env, fs,
     path::PathBuf,
 };
@@ -29,11 +29,16 @@ struct RawMarket {
     last_updated_time: i64,
 }
 impl RawMarket {
-    fn resolution_bool(&self) -> Option<bool> {
-        match self.resolution.as_deref() {
-            Some("YES") => Some(true),
-            Some("NO") => Some(false),
-            _ => None,
+    fn resolution_bool(&self, mut answer: Option<&str>) -> Option<bool> {
+        if answer == Some("undefined") {
+            answer = None;
+        };
+        match (self.resolution.as_deref()?, answer) {
+            ("YES", None) => Some(true),
+            ("NO", None) => Some(false),
+            ("CANCEL", _) | ("CHOOSE_MULTIPLE", Some(_)) | ("MKT", None) => None,
+            (correct_id, Some(answer)) if correct_id.len() == 12 => Some(correct_id == answer),
+            _ => panic!("Unknown resolution ({:?}, {:?})", self.resolution, answer),
         }
     }
 }
@@ -66,6 +71,7 @@ struct RawBet {
     is_redemption: bool,
     user_username: Option<String>,
     user_avatar_url: Option<String>,
+    answer_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,14 +89,22 @@ fn main() {
     }
     let markets = markets;
 
-    let bets_dir = data_path.join("bets");
-    let mut bets_files = fs::read_dir(&bets_dir)
+    let dump_bets_dir = data_path.join("bets");
+    let recent_bets_dir = data_path.join("bets");
+    let mut dump_bets_files = fs::read_dir(&dump_bets_dir)
         .unwrap()
-        .map(|file| file.as_ref().unwrap().file_name().into_string().unwrap())
+        .map(|file| dump_bets_dir.join(file.as_ref().unwrap().file_name().into_string().unwrap()))
         .filter(|file| file.ends_with(".json"))
         .collect::<Vec<_>>();
-    bets_files.sort();
-    bets_files.reverse(); // oldest to newest
+    dump_bets_files.sort();
+    dump_bets_files.reverse(); // oldest to newest
+    let mut recent_bets_files  =fs::read_dir(&dump_bets_dir)
+        .unwrap()
+        .map(|file| recent_bets_dir.join(file.as_ref().unwrap().file_name().into_string().unwrap()))
+        .filter(|file| file.ends_with(".json"))
+        .collect::<Vec<_>>();
+    recent_bets_files.sort();
+    let bets_files = [dump_bets_files, recent_bets_files].concat();
 
     // (predictions where it resolved YES, predictions where it resolved NO)
     let mut buckets = vec![(0., 0.); 101];
@@ -98,11 +112,18 @@ fn main() {
     let mut bets_on_delisted = 0usize;
     let mut bet_count = 0usize;
     for bets_file in bets_files {
-        eprintln!("Doing bets file {}", bets_file);
-        let bets_file = bets_dir.join(bets_file);
-        let bets = fs::read_to_string(bets_file).unwrap();
+        eprintln!("Doing bets file {}", bets_file.display());
+        let bets_file = bets_file;
+        let bets = fs::read_to_string(bets_file.clone()).unwrap();
         let bets: BetList = serde_json::from_str(&bets).unwrap();
-        for bet in bets.0.into_iter().rev() {
+        // ugly hack until data dump is updated
+        let iter = if bets_file.file_name().unwrap().to_str().unwrap().contains("0000") {
+            bets.0.into_iter()
+        } else {
+            // TODO: avoid collect here
+            bets.0.into_iter().rev().collect::<Vec<_>>().into_iter()
+        };
+        for bet in iter {
             bet_count += 1;
             // if bet.is_redemption || bet.amount <= 0. {
             //     continue;
@@ -121,17 +142,19 @@ fn main() {
                 continue;
             }
 
-            match market.resolution_bool() {
+            match market.resolution_bool(bet.answer_id.as_deref()) {
                 None => continue,
                 Some(true) => buckets[bucket].0 += 1.,
                 Some(false) => buckets[bucket].1 += 1.,
             };
+
             const CUTOFF: i64 = 1673644409604;
             if bet.created_time <= CUTOFF
                 && market.close_time >= CUTOFF
                 && market.resolution_time.unwrap() >= CUTOFF
             {
-                market_probs_at_cutoff.insert(market.id.clone(), bet.prob_after);
+                market_probs_at_cutoff
+                    .insert((market.id.clone(), bet.answer_id.clone()), bet.prob_after);
             }
         }
     }
@@ -139,10 +162,10 @@ fn main() {
     eprintln!("Processed {} bets", bet_count);
     eprintln!("Ignored {} bets on delisted contracts", bets_on_delisted);
     let mut cutoff_buckets = vec![(0., 0.); 101];
-    for (market_id, prob) in market_probs_at_cutoff {
+    for ((market_id, answer_id), prob) in market_probs_at_cutoff {
         let market = markets.get(&market_id).unwrap();
-        let bucket = (prob * 100.0).round() as usize;
-        match market.resolution_bool() {
+        let bucket = (prob * 50.0).round() as usize * 2;
+        match market.resolution_bool(answer_id.as_deref()) {
             None => unreachable!(),
             Some(true) => cutoff_buckets[bucket].0 += 1.,
             Some(false) => cutoff_buckets[bucket].1 += 1.,
