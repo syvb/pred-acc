@@ -16,14 +16,14 @@ do
     file="/tmp/recent-bets/$(printf '%010d' $idx).json"
     echo doing $idx $bet $file
 
-    while [ ! -f $pending_socket ]
+    while [ ! -S $pending_socket ]
     do
         sleep 0.1
     done
 
     socket=$pending_socket # the old $socket is closed now
     pending_socket=/tmp/mffetch-$idx-$RANDOM # prepare next socket
-    socat openssl-connect:api.manifold.markets:443 UNIX-LISTEN:$socket &
+    socat openssl-connect:api.manifold.markets:443 UNIX-LISTEN:$pending_socket &
 
     curl -v --http1.1 --unix-socket $socket -H "Connection: keep-alive" "http://api.manifold.markets:443/v0/bets?order=asc&after=$bet" > $file
 
