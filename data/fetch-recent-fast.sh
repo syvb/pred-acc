@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# this doesn't actually work right but it would be cool if it did
+
 # nix-shell -p dig socat --run "./fetch-recent-fast.sh"
 
 set -ex
@@ -23,9 +25,9 @@ do
 
     socket=$pending_socket # the old $socket is closed now
     pending_socket=/tmp/mffetch-$idx-$RANDOM # prepare next socket
-    socat openssl-connect:api.manifold.markets:443 UNIX-LISTEN:$pending_socket &
+    socat openssl-connect:api.manifold.markets:443 UNIX-LISTEN:$pending_socket 2> /dev/null &
 
-    curl -v --http1.1 --unix-socket $socket -H "Connection: keep-alive" "http://api.manifold.markets:443/v0/bets?order=asc&after=$bet" > $file
+    curl -s --http1.1 --unix-socket $socket -H "Connection: keep-alive" "http://api.manifold.markets:443/v0/bets?order=asc&after=$bet" > $file
 
     idx=$((idx + 1))
     bet=$(jq -r '.[-1].id' < $file)
