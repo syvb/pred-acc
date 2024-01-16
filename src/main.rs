@@ -1,30 +1,28 @@
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    env, fs,
-    path::PathBuf,
-};
+use std::{collections::BTreeMap, env, fs, path::PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawMarket {
     id: String,
-    creator_id: String,
+    creator_id: Option<String>, // missing in Issac market dumps
     creator_username: String,
-    creator_name: String,
+    creator_name: Option<String>, // missing in Issac market dumps
     created_time: i64,
-    creator_avatar_url: String,
-    close_time: i64,
+    creator_avatar_url: Option<String>, // missing in Issac market dumps
+    close_time: Option<i64>,            // a few are missing in Issac market dumps
     question: String,
-    url: String,
+    url: Option<String>,          // missing in Issac market dumps
     total_liquidity: Option<f64>, // missing on some markets
-    outcome_type: String,
-    mechanism: String,
+    outcome_type: Option<String>, // missing in Issac market dumps
+    mechanism: Option<String>,    // missing in Issac market dumps
+    #[serde(rename = "type")]
+    type_: Option<String>, // only in Issac dumps
     volume: f64,
     #[serde(rename = "volume24Hours")]
     volume_24_hours: f64,
-    is_resolved: bool,
-    resolution: Option<String>,
+    is_resolved: Option<bool>,
+    resolution: Option<serde_json::Value>,
     resolution_time: Option<i64>,
     last_updated_time: i64,
 }
@@ -33,7 +31,18 @@ impl RawMarket {
         if answer == Some("undefined") {
             answer = None;
         };
-        match (self.resolution.as_deref()?, answer) {
+        let resolution = self.resolution.as_ref()?;
+        let resolution = match resolution {
+            serde_json::Value::String(s) => &*s,
+            // if it's a float then it resolved at MKT
+            serde_json::Value::Number(num) => match num.as_i64()? {
+                0 => "NO",
+                1 => "YES",
+                num => panic!("unknown resolution {:?}", num),
+            },
+            _ => panic!("unknown resolution {:?}", resolution),
+        };
+        match (resolution, answer) {
             ("YES", None) => Some(true),
             ("NO", None) => Some(false),
             ("CANCEL", _) | ("CHOOSE_MULTIPLE", Some(_)) | ("MKT", None) => None,
@@ -79,7 +88,7 @@ struct BetList(Vec<RawBet>);
 
 fn main() {
     let data_path: PathBuf = env::args().nth(1).expect("no path :(").parse().unwrap();
-    let raw_markets = data_path.join("markets.json");
+    let raw_markets = data_path.join("allMarketData.json");
     let raw_markets = fs::read_to_string(raw_markets)
         .expect("couldn't read markets.json  - try `make dl && make`");
     let raw_markets: MarketsJson = serde_json::from_str(&raw_markets).unwrap();
@@ -90,18 +99,18 @@ fn main() {
     let markets = markets;
 
     let dump_bets_dir = data_path.join("bets");
-    let recent_bets_dir = data_path.join("bets");
+    let recent_bets_dir = data_path.join("recent-bets");
     let mut dump_bets_files = fs::read_dir(&dump_bets_dir)
         .unwrap()
         .map(|file| dump_bets_dir.join(file.as_ref().unwrap().file_name().into_string().unwrap()))
-        .filter(|file| file.ends_with(".json"))
+        .filter(|file| file.extension().unwrap().to_str().unwrap() == "json")
         .collect::<Vec<_>>();
     dump_bets_files.sort();
     dump_bets_files.reverse(); // oldest to newest
-    let mut recent_bets_files  =fs::read_dir(&dump_bets_dir)
+    let mut recent_bets_files = fs::read_dir(&recent_bets_dir)
         .unwrap()
         .map(|file| recent_bets_dir.join(file.as_ref().unwrap().file_name().into_string().unwrap()))
-        .filter(|file| file.ends_with(".json"))
+        .filter(|file| file.extension().unwrap().to_str().unwrap() == "json")
         .collect::<Vec<_>>();
     recent_bets_files.sort();
     let bets_files = [dump_bets_files, recent_bets_files].concat();
@@ -117,7 +126,13 @@ fn main() {
         let bets = fs::read_to_string(bets_file.clone()).unwrap();
         let bets: BetList = serde_json::from_str(&bets).unwrap();
         // ugly hack until data dump is updated
-        let iter = if bets_file.file_name().unwrap().to_str().unwrap().contains("0000") {
+        let iter = if bets_file
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("0000")
+        {
             bets.0.into_iter()
         } else {
             // TODO: avoid collect here
@@ -136,8 +151,10 @@ fn main() {
                 bets_on_delisted += 1;
                 continue;
             };
-            if market.mechanism != "cpmm-1"
-                || ((market.close_time - market.created_time) < (86400000 * 7))
+            if market.mechanism.as_ref().map(|mech| mech != "cpmm-1").unwrap_or(false)
+                || market.type_.as_ref().map(|t| !t.contains("cpmm-1")).unwrap_or(false)
+                || market.close_time.is_none() // issue with some Issac market dumps
+                // || ((market.close_time.unwrap() - market.created_time) < (86400000 * 7))
             {
                 continue;
             }
@@ -148,10 +165,10 @@ fn main() {
                 Some(false) => buckets[bucket].1 += 1.,
             };
 
-            const CUTOFF: i64 = 1673644409604;
+            const CUTOFF: i64 = 1682913600000;
             if bet.created_time <= CUTOFF
-                && market.close_time >= CUTOFF
-                && market.resolution_time.unwrap() >= CUTOFF
+                && market.close_time.unwrap() >= CUTOFF
+                // && market.resolution_time.unwrap() >= CUTOFF
             {
                 market_probs_at_cutoff
                     .insert((market.id.clone(), bet.answer_id.clone()), bet.prob_after);
@@ -164,7 +181,7 @@ fn main() {
     let mut cutoff_buckets = vec![(0., 0.); 101];
     for ((market_id, answer_id), prob) in market_probs_at_cutoff {
         let market = markets.get(&market_id).unwrap();
-        let bucket = (prob * 50.0).round() as usize * 2;
+        let bucket = (prob * 25.0).round() as usize * 4;
         match market.resolution_bool(answer_id.as_deref()) {
             None => unreachable!(),
             Some(true) => cutoff_buckets[bucket].0 += 1.,
