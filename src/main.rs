@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, env, fs, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env, fs,
+    path::PathBuf,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,12 +92,21 @@ struct BetList(Vec<RawBet>);
 
 fn main() {
     let data_path: PathBuf = env::args().nth(1).expect("no path :(").parse().unwrap();
-    let raw_markets = data_path.join("allMarketData.json");
-    let raw_markets = fs::read_to_string(raw_markets)
+    let raw_markets_issac = data_path.join("allMarketData.json");
+    let raw_markets_issac = fs::read_to_string(raw_markets_issac)
         .expect("couldn't read markets.json  - try `make dl && make`");
-    let raw_markets: MarketsJson = serde_json::from_str(&raw_markets).unwrap();
+    let raw_markets_issac: MarketsJson = serde_json::from_str(&raw_markets_issac).unwrap();
+
+    let raw_markets_dump = data_path.join("markets.json");
+    let raw_markets_dump = fs::read_to_string(raw_markets_dump)
+        .expect("couldn't read markets.json  - try `make dl && make`");
+    let raw_markets_dump: MarketsJson = serde_json::from_str(&raw_markets_dump).unwrap();
     let mut markets = BTreeMap::new();
-    for market in raw_markets.0 {
+    for market in raw_markets_issac.0 {
+        markets.insert(market.id.clone(), market);
+    }
+    // dump data is better so perfer that over Issac's data
+    for market in raw_markets_dump.0 {
         markets.insert(market.id.clone(), market);
     }
     let markets = markets;
@@ -118,6 +131,7 @@ fn main() {
     // (predictions where it resolved YES, predictions where it resolved NO)
     let mut buckets = vec![(0., 0.); 101];
     let mut market_probs_at_cutoff = BTreeMap::new();
+    let mut missing_markets = BTreeSet::new();
     let mut bets_on_delisted = 0usize;
     let mut bet_count = 0usize;
     for bets_file in bets_files {
@@ -148,13 +162,23 @@ fn main() {
                 market
             } else {
                 // ignore bets on delisted contracts
+                missing_markets.insert(bet.contract_id);
                 bets_on_delisted += 1;
                 continue;
             };
-            if market.mechanism.as_ref().map(|mech| mech != "cpmm-1").unwrap_or(false)
-                || market.type_.as_ref().map(|t| !t.contains("cpmm-1")).unwrap_or(false)
-                || market.close_time.is_none() // issue with some Issac market dumps
-                // || ((market.close_time.unwrap() - market.created_time) < (86400000 * 7))
+            if market
+                .mechanism
+                .as_ref()
+                .map(|mech| mech != "cpmm-1")
+                .unwrap_or(false)
+                || market
+                    .type_
+                    .as_ref()
+                    .map(|t| !t.contains("cpmm-1"))
+                    .unwrap_or(false)
+                || market.close_time.is_none()
+            // issue with some Issac market dumps
+            // || ((market.close_time.unwrap() - market.created_time) < (86400000 * 7))
             {
                 continue;
             }
@@ -166,9 +190,8 @@ fn main() {
             };
 
             const CUTOFF: i64 = 1682913600000;
-            if bet.created_time <= CUTOFF
-                && market.close_time.unwrap() >= CUTOFF
-                // && market.resolution_time.unwrap() >= CUTOFF
+            if bet.created_time <= CUTOFF && market.close_time.unwrap() >= CUTOFF
+            // && market.resolution_time.unwrap() >= CUTOFF
             {
                 market_probs_at_cutoff
                     .insert((market.id.clone(), bet.answer_id.clone()), bet.prob_after);
@@ -177,7 +200,12 @@ fn main() {
     }
 
     eprintln!("Processed {} bets", bet_count);
-    eprintln!("Ignored {} bets on delisted contracts", bets_on_delisted);
+    eprintln!(
+        "Ignored {} bets on delisted contracts across {} markets",
+        bets_on_delisted,
+        missing_markets.len()
+    );
+    dbg!(missing_markets);
     let mut cutoff_buckets = vec![(0., 0.); 101];
     for ((market_id, answer_id), prob) in market_probs_at_cutoff {
         let market = markets.get(&market_id).unwrap();
